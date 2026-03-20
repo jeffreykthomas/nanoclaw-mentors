@@ -3,7 +3,8 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { DATA_DIR, GROUPS_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { sendPoolMessage, sendTelegramMedia } from './channels/telegram.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -80,15 +81,83 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.sender && data.chatJid.startsWith('tg:')) {
+                    await sendPoolMessage(
+                      data.chatJid,
+                      data.text,
+                      data.sender,
+                      sourceGroup,
+                    );
+                  } else {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    { chatJid: data.chatJid, sourceGroup, sender: data.sender },
                     'IPC message sent',
                   );
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'media' &&
+                data.chatJid &&
+                data.filePath &&
+                data.mediaType
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  // Resolve container path to host path
+                  // /workspace/group/... → groups/{folder}/...
+                  // /tmp/... or other paths → inside the container, not accessible
+                  let hostPath = data.filePath as string;
+                  if (hostPath.startsWith('/workspace/group/')) {
+                    hostPath = path.join(
+                      GROUPS_DIR,
+                      sourceGroup,
+                      hostPath.slice('/workspace/group/'.length),
+                    );
+                  }
+
+                  if (
+                    data.chatJid.startsWith('tg:') &&
+                    fs.existsSync(hostPath)
+                  ) {
+                    await sendTelegramMedia(
+                      data.chatJid,
+                      hostPath,
+                      data.mediaType as 'photo' | 'video',
+                      data.caption as string | undefined,
+                    );
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        mediaType: data.mediaType,
+                        filePath: hostPath,
+                      },
+                      'IPC media sent',
+                    );
+                  } else if (!fs.existsSync(hostPath)) {
+                    logger.warn(
+                      { filePath: data.filePath, hostPath, sourceGroup },
+                      'IPC media file not found on host (file may be in /tmp inside container)',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid },
+                      'Media sending only supported for Telegram channels',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC media attempt blocked',
                   );
                 }
               }

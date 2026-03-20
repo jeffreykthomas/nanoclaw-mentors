@@ -26,6 +26,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -220,6 +221,30 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Pass integration tokens for container tools (git, Google Drive, etc.)
+  const integrationKeys = [
+    'GITHUB_TOKEN',
+    'GOOGLE_SERVICE_ACCOUNT_JSON',
+    'GOOGLE_IMPERSONATE_EMAIL',
+    'GOOGLE_DRIVE_WRITE_FOLDER_ID',
+    'GMAIL_SEND_AS',
+    'YOUTUBE_TOKEN_JSON',
+    'YOUTUBE_CREDENTIALS_JSON',
+    'GOOGLE_ADS_DEVELOPER_TOKEN',
+    'GOOGLE_ADS_CUSTOMER_ID',
+    'GOOGLE_ADS_LOGIN_CUSTOMER_ID',
+    'GA4_PROPERTY_ID',
+    'ELEVENLABS_API_KEY',
+  ];
+  const integrationEnv = readEnvFile(integrationKeys);
+  const integrationVars: Record<string, string | undefined> = {};
+  for (const key of integrationKeys) {
+    integrationVars[key] = process.env[key] || integrationEnv[key];
+  }
+  for (const [key, value] of Object.entries(integrationVars)) {
+    if (value) args.push('-e', `${key}=${value}`);
+  }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(

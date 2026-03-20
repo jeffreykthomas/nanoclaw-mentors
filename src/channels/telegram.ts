@@ -1,8 +1,11 @@
+import fs from 'fs';
 import https from 'https';
-import { Api, Bot } from 'grammy';
+import path from 'path';
+import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -11,6 +14,136 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+// Bot pool for agent teams: send-only Api instances (no polling)
+const poolApis: Api[] = [];
+// Maps "{groupFolder}:{senderName}" → pool Api index for stable assignment
+const senderBotMap = new Map<string, number>();
+let nextPoolIndex = 0;
+
+/**
+ * Initialize send-only Api instances for the bot pool.
+ * Each pool bot can send messages but doesn't poll for updates.
+ */
+export async function initBotPool(tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    try {
+      const api = new Api(token);
+      const me = await api.getMe();
+      poolApis.push(api);
+      logger.info(
+        { username: me.username, id: me.id, poolSize: poolApis.length },
+        'Pool bot initialized',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to initialize pool bot');
+    }
+  }
+  if (poolApis.length > 0) {
+    logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
+  }
+}
+
+/**
+ * Send a message via a pool bot assigned to the given sender name.
+ * Assigns bots round-robin on first use; subsequent messages from the
+ * same sender in the same group always use the same bot.
+ * On first assignment, renames the bot to match the sender's role.
+ */
+export async function sendPoolMessage(
+  chatId: string,
+  text: string,
+  sender: string,
+  groupFolder: string,
+): Promise<void> {
+  if (poolApis.length === 0) {
+    return;
+  }
+
+  const key = `${groupFolder}:${sender}`;
+  let idx = senderBotMap.get(key);
+  if (idx === undefined) {
+    idx = nextPoolIndex % poolApis.length;
+    nextPoolIndex++;
+    senderBotMap.set(key, idx);
+    // Rename the bot to match the sender's role, then wait for Telegram to propagate
+    try {
+      await poolApis[idx].setMyName(sender);
+      await new Promise((r) => setTimeout(r, 2000));
+      logger.info(
+        { sender, groupFolder, poolIndex: idx },
+        'Assigned and renamed pool bot',
+      );
+    } catch (err) {
+      logger.warn(
+        { sender, err },
+        'Failed to rename pool bot (sending anyway)',
+      );
+    }
+  }
+
+  const api = poolApis[idx];
+  try {
+    const numericId = chatId.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await sendTelegramMessage(api, numericId, text);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await sendTelegramMessage(
+          api,
+          numericId,
+          text.slice(i, i + MAX_LENGTH),
+        );
+      }
+    }
+    logger.info(
+      { chatId, sender, poolIndex: idx, length: text.length },
+      'Pool message sent',
+    );
+  } catch (err) {
+    logger.error({ chatId, sender, err }, 'Failed to send pool message');
+  }
+}
+
+// Module-level reference to the main bot for media sending
+let mainBotApi: Api | null = null;
+
+/**
+ * Send a photo or video to a Telegram chat.
+ * Called from IPC handler for inline media delivery.
+ */
+export async function sendTelegramMedia(
+  chatId: string,
+  filePath: string,
+  mediaType: 'photo' | 'video',
+  caption?: string,
+): Promise<void> {
+  const api = mainBotApi;
+  if (!api) {
+    logger.warn('Cannot send media: Telegram bot not initialized');
+    return;
+  }
+
+  const numericId = chatId.replace(/^tg:/, '');
+  try {
+    const fileData = new InputFile(
+      fs.readFileSync(filePath),
+      path.basename(filePath),
+    );
+    if (mediaType === 'photo') {
+      await api.sendPhoto(numericId, fileData, { caption });
+    } else {
+      await api.sendVideo(numericId, fileData, { caption });
+    }
+    logger.info({ chatId, mediaType, filePath }, 'Telegram media sent');
+  } catch (err) {
+    logger.error(
+      { chatId, mediaType, filePath, err },
+      'Failed to send Telegram media',
+    );
+  }
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -165,6 +298,48 @@ export class TelegramChannel implements Channel {
       );
     });
 
+    // Download a Telegram file to the group's attachments directory.
+    // Returns the container-relative path (/workspace/group/attachments/...) or null on failure.
+    const downloadTelegramFile = async (
+      fileId: string,
+      group: RegisteredGroup,
+      filename: string,
+    ): Promise<string | null> => {
+      try {
+        const file = await this.bot!.api.getFile(fileId);
+        if (!file.file_path) return null;
+
+        const groupDir = resolveGroupFolderPath(group.folder);
+        const attachDir = path.join(groupDir, 'attachments');
+        fs.mkdirSync(attachDir, { recursive: true });
+
+        const localPath = path.join(attachDir, filename);
+        const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+
+        await new Promise<void>((resolve, reject) => {
+          const outStream = fs.createWriteStream(localPath);
+          https
+            .get(fileUrl, (res) => {
+              res.pipe(outStream);
+              outStream.on('finish', () => {
+                outStream.close();
+                resolve();
+              });
+            })
+            .on('error', reject);
+        });
+
+        logger.info(
+          { filename, group: group.folder },
+          'Telegram attachment downloaded',
+        );
+        return `/workspace/group/attachments/${filename}`;
+      } catch (err) {
+        logger.error({ err, fileId }, 'Failed to download Telegram file');
+        return null;
+      }
+    };
+
     // Handle non-text messages with placeholders so the agent knows something was sent
     const storeNonText = (ctx: any, placeholder: string) => {
       const chatJid = `tg:${ctx.chat.id}`;
@@ -199,8 +374,115 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
-    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
+    // Photos: download the largest size and pass the path to the agent
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const photos = ctx.message.photo;
+      const largest = photos[photos.length - 1]; // Last element is highest resolution
+      const ext = 'jpg';
+      const filename = `photo_${ctx.message.message_id}.${ext}`;
+      const containerPath = await downloadTelegramFile(
+        largest.file_id,
+        group,
+        filename,
+      );
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      const content = containerPath
+        ? `[Photo: ${containerPath}]${caption}`
+        : `[Photo]${caption}`;
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
+
+    // Videos: download and pass the path to the agent
+    this.bot.on('message:video', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const video = ctx.message.video;
+      const ext = video.mime_type?.split('/')[1] || 'mp4';
+      const filename = `video_${ctx.message.message_id}.${ext}`;
+
+      // Telegram Bot API has a 20MB download limit — check file_size if available
+      const sizeMB = video.file_size ? video.file_size / (1024 * 1024) : 0;
+      let containerPath: string | null = null;
+      if (sizeMB <= 20) {
+        containerPath = await downloadTelegramFile(
+          video.file_id,
+          group,
+          filename,
+        );
+      } else {
+        logger.warn(
+          { sizeMB, filename },
+          'Video too large for Telegram Bot API download (>20MB)',
+        );
+      }
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      const content = containerPath
+        ? `[Video: ${containerPath}]${caption}`
+        : sizeMB > 20
+          ? `[Video: too large to download (${sizeMB.toFixed(0)}MB), ask user for a Drive link]${caption}`
+          : `[Video]${caption}`;
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
@@ -218,6 +500,9 @@ export class TelegramChannel implements Channel {
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
+
+    // Store reference for media sending
+    mainBotApi = this.bot.api;
 
     // Start polling — returns a Promise that resolves when started
     return new Promise<void>((resolve) => {
@@ -277,6 +562,7 @@ export class TelegramChannel implements Channel {
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
+      mainBotApi = null;
       logger.info('Telegram bot stopped');
     }
   }

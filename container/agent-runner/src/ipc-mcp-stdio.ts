@@ -63,6 +63,45 @@ server.tool(
 );
 
 server.tool(
+  'send_media',
+  "Send a photo or video directly in the chat. The file must exist in your workspace. Use this for drafts, previews, and generated content so the user can see it inline without clicking a link. Telegram limit: 10MB for photos, 50MB for videos.",
+  {
+    file_path: z.string().describe('Absolute path to the media file in the container (e.g., /workspace/group/output/image.png, /tmp/video.mp4)'),
+    caption: z.string().optional().describe('Optional caption text to accompany the media'),
+    media_type: z.enum(['photo', 'video']).optional().describe('Type of media. Auto-detected from extension if not provided.'),
+    sender: z.string().optional().describe('Your role/identity name for Telegram swarm (e.g. "Designer")'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    const ext = path.extname(args.file_path).toLowerCase();
+    const photoExts = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+    const videoExts = new Set(['.mp4', '.mov', '.avi', '.mkv', '.webm']);
+    const mediaType = args.media_type || (photoExts.has(ext) ? 'photo' : videoExts.has(ext) ? 'video' : 'photo');
+
+    const data: Record<string, string | undefined> = {
+      type: 'media',
+      chatJid,
+      filePath: args.file_path,
+      mediaType,
+      caption: args.caption || undefined,
+      sender: args.sender || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `${mediaType === 'photo' ? 'Photo' : 'Video'} sent.` }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 
